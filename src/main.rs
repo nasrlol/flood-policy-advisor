@@ -72,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
             token: env("ANTHROPIC_AUTH_TOKEN"),
             model: env("POLICY_MODEL").unwrap_or_else(|| "claude-opus-5-5".into()),
             effort: env("POLICY_EFFORT").unwrap_or_else(|| "medium".into()),
+            local_url: env("POLICY_LOCAL_URL").unwrap_or_else(|| "http://127.0.0.1:11434".into()),
+            local_model: env("POLICY_LOCAL_MODEL"),
         },
         out,
         slots: Semaphore::new(2),
@@ -91,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(app.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("policy_api on http://{addr} (llm: {})", if app.llm.enabled() { &app.llm.model } else { "off, rules only" });
+    println!("policy_api on http://{addr} (llm: {})", app.llm.name().unwrap_or_else(|| "off, rules only".into()));
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -100,7 +102,7 @@ async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "llm": app.llm.enabled(),
-        "model": app.llm.enabled().then(|| app.llm.model.clone()),
+        "model": app.llm.name(),
         "policies": policies::POLICIES.len(),
     }))
 }
@@ -150,7 +152,7 @@ async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, Json(
                 let problems = llm::validate(&mut advice, &facts);
                 let log = json!({"raw": raw, "usage": usage, "problems": problems, "seconds": secs});
                 if problems.is_empty() {
-                    (log, Some(from_llm(&advice, &facts, &app.llm.model)))
+                    (log, Some(from_llm(&advice, &facts, &app.llm.name().unwrap_or_default())))
                 } else {
                     ai_rejected = Some(json!({"reason": "validation failed", "problems": problems}));
                     (log, None)
@@ -196,7 +198,7 @@ fn rec_json(rank: usize, id: &str, priority: &str, why: &str, evidence: &[String
 
 fn from_llm(a: &llm::LlmAdvice, facts: &facts::Facts, model: &str) -> Value {
     json!({
-        "source": "claude",
+        "source": if model.starts_with("local:") { "local" } else { "claude" },
         "model": model,
         "summary": a.summary,
         "recommendations": a.recommendations.iter().enumerate()

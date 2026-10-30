@@ -1,4 +1,5 @@
-//! One Claude call: facts + rule candidates in, structured policy advice out, then validated.
+//! One LLM call (Claude, or a local ollama model when no key is set): facts + rule candidates in,
+//! structured policy advice out, then validated.
 
 use crate::facts::Facts;
 use crate::policies::{self, POLICIES};
@@ -13,6 +14,8 @@ pub struct Llm {
     pub token: Option<String>, // Authorization: Bearer (OAuth)
     pub model: String,
     pub effort: String,
+    pub local_url: String,           // ollama
+    pub local_model: Option<String>, // e.g. qwen3:8b; used when no Anthropic credentials
 }
 
 #[derive(Deserialize, Clone)]
@@ -81,12 +84,57 @@ pub fn prompt(facts: &Facts, triggers: &[Trigger], caveats: &[String], area: &st
 }
 
 impl Llm {
-    pub fn enabled(&self) -> bool {
+    fn claude(&self) -> bool {
         self.key.is_some() || self.token.is_some()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.claude() || self.local_model.is_some()
+    }
+
+    /// Model that answers: Claude when a key is set, else the local model.
+    pub fn name(&self) -> Option<String> {
+        if self.claude() {
+            Some(self.model.clone())
+        } else {
+            self.local_model.as_ref().map(|m| format!("local:{m}"))
+        }
     }
 
     /// Returns (parsed advice, raw text, usage).
     pub async fn ask(&self, user: &str) -> Result<(LlmAdvice, String, Value)> {
+        match (&self.local_model, self.claude()) {
+            (Some(m), false) => self.ask_local(m, user).await,
+            _ => self.ask_claude(user).await,
+        }
+    }
+
+    async fn ask_local(&self, model: &str, user: &str) -> Result<(LlmAdvice, String, Value)> {
+        let body = json!({
+            "model": model,
+            "stream": false,
+            "think": false,
+            "format": schema(),
+            "options": {"temperature": 0.2, "num_ctx": 16384},
+            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+        });
+        let url = format!("{}/api/chat", self.local_url.trim_end_matches('/'));
+        let r = self.http.post(&url).json(&body).send().await.context("local model unreachable")?;
+        let status = r.status();
+        let v: Value = r.json().await.context("local model: bad JSON")?;
+        if !status.is_success() {
+            bail!("local model {status}: {}", v["error"]);
+        }
+        let text = v.pointer("/message/content").and_then(Value::as_str).unwrap_or("").to_string();
+        let advice: LlmAdvice = serde_json::from_str(&text).context("local model output does not match the schema")?;
+        let usage = json!({
+            "input_tokens": v["prompt_eval_count"], "output_tokens": v["eval_count"],
+            "seconds": v["total_duration"].as_f64().map(|ns| ns / 1e9),
+        });
+        Ok((advice, text, usage))
+    }
+
+    async fn ask_claude(&self, user: &str) -> Result<(LlmAdvice, String, Value)> {
         let body = json!({
             "model": self.model,
             "max_tokens": 16000,
