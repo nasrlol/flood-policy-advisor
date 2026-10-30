@@ -1,0 +1,17 @@
+[Unit]
+Description=EU AI Challenge flood policy advisor API (tailnet only)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=nasr
+WorkingDirectory=/home/nasr/policy_api
+ExecStart=/home/nasr/policy_api/target/release/policy_api
+# POLICY_ADDR=<tailnet ip>:8082 and ANTHROPIC_API_KEY=... live in /etc/policy-api.env (root-only, never in git)
+Environment=POLICY_OUT=/home/nasr/policy_api/out
+EnvironmentFile=-/etc/policy-api.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
