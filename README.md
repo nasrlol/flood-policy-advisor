@@ -71,4 +71,12 @@ ANTHROPIC_API_KEY=... POLICY_ADDR=127.0.0.1:8082 ./target/release/policy_api
 ## Hosting (team server, tailnet only)
 - Port 8082, systemd `policy-api` (`deploy/policy-api.service`).
 - `POLICY_ADDR` and the key go in `/etc/policy-api.env` (root, mode 600), never in git.
-- Update: `cd ~/policy_api && git pull && cargo build --release && sudo systemctl restart policy-api`.
+- Update: automatic (CI/CD below). By hand: `cd ~/policy_api && git pull && cargo build --release && sudo systemctl restart policy-api`.
+
+## CI/CD
+- **CI** (`.github/workflows/ci.yml`, every PR and push): `cargo build` + `cargo test`, smoke test (`/health`, `/version`, `/policies`).
+- **CD**: green `main` → branch `live`. The server pulls `live` every minute, builds and restarts (`deploy/deploy.sh`,
+  systemd `policy-api-deploy.timer`); a failed build keeps the old binary. The `verify` job waits until
+  https://dev.nsrddyn.com/policy/version returns the commit. Roll back: push an older commit to `live`.
+- `GET /version`: git commit of the running build (`dev` when built without `GIT_SHA`).
+- Server setup (once): `sudo cp deploy/policy-api-deploy.{service,timer} /etc/systemd/system/ && sudo systemctl enable --now policy-api-deploy.timer`. Log: `journalctl -u policy-api-deploy`.

@@ -1,0 +1,63 @@
+# CI on every PR and push. CD: a green main is pushed to branch `live`; valencia pulls `live` every minute,
+# builds policy_api and restarts it (deploy/), then `verify` checks the public API runs this commit.
+name: policy_api CI/CD
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+        env:
+          GIT_SHA: ${{ github.sha }}
+
+      - name: Tests
+        run: cargo test --release --locked
+
+      - name: Smoke test (server starts, light routes answer)
+        env:
+          POLICY_ADDR: 127.0.0.1:8092
+          POLICY_OUT: ${{ runner.temp }}/out
+        run: |
+          target/release/policy_api > server.log 2>&1 &
+          for i in $(seq 40); do curl -sf -o /dev/null http://$POLICY_ADDR/health && break; sleep 0.5; done
+          curl -sf http://$POLICY_ADDR/health || { cat server.log; exit 1; }; echo
+          [ "$(curl -sf http://$POLICY_ADDR/version)" = "$GITHUB_SHA" ] || { echo "::error::/version is not $GITHUB_SHA"; exit 1; }
+          curl -sf -o /dev/null http://$POLICY_ADDR/policies || { echo "::error::/policies failed"; cat server.log; exit 1; }
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move branch live to this commit
+        run: git push --force origin HEAD:refs/heads/live
+
+  verify:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait until the public API runs this commit (pull every minute + cargo build)
+        run: |
+          for i in $(seq 45); do
+            v=$(curl -s https://dev.nsrddyn.com/policy/version || true)
+            [ "$v" = "$GITHUB_SHA" ] && { echo "live: $v"; exit 0; }
+            sleep 20
+          done
+          echo "::error::dev.nsrddyn.com/policy still runs '$v' after 15 min (journalctl -u policy-api-deploy on valencia)"; exit 1
