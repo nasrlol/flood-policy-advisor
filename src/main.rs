@@ -108,6 +108,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let router = Router::new()
         .route("/health", get(health))
+        // git commit of this build (deploy sets GIT_SHA), checked by CI after a deploy
+        .route("/version", get(|| async { option_env!("GIT_SHA").unwrap_or("dev") }))
         .route("/policies", get(|| async { Json(json!({"policies": policies::POLICIES})) }))
         .route("/advise", post(advise))
         .route("/jobs/:id", get(job))

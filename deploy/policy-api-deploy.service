@@ -1,0 +1,10 @@
+[Unit]
+Description=policy_api: pull branch live, build, restart (CD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nasr
+Environment=REPO_DIR=/home/nasr/policy_api
+ExecStart=/bin/sh /home/nasr/policy_api/deploy/deploy.sh
