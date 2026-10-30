@@ -1,5 +1,6 @@
 //! Policy advisor API: takes the flood model results the frontend already has and answers
-//! which of the team's policies the mayor should take, in which order (Claude + rule fallback).
+//! which of the team's policies the mayor should take, in which order (Claude or a local model,
+//! with a rule-based fallback).
 
 mod facts;
 mod llm;
@@ -7,8 +8,8 @@ mod policies;
 mod rules;
 
 use axum::{
-    extract::{Query, State},
-    http::{HeaderValue, StatusCode},
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,8 +20,11 @@ use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{io::AsyncWriteExt, sync::{Mutex, Semaphore}};
 use tower_http::cors::{Any, CorsLayer};
@@ -32,6 +36,13 @@ struct App {
     out: PathBuf,
     slots: Semaphore,
     cache: Mutex<HashMap<u64, Value>>,
+    jobs: Mutex<HashMap<u64, Job>>,
+    next_job: AtomicU64,
+}
+
+enum Job {
+    Running(Instant),
+    Done(StatusCode, Value),
 }
 
 #[derive(Deserialize)]
@@ -42,6 +53,10 @@ struct AdviseReq {
     question: String,
     #[serde(default)]
     language: String,
+    /// "claude" | "local" | "rules"; empty = server default. The Claude key, if the frontend
+    /// supplies one, comes in the `x-anthropic-key` header (never in the body, never logged).
+    #[serde(default)]
+    provider: String,
     /// flood_api responses keyed by endpoint: flood, evacuation, timeline, region, impact, models.
     /// They may also be sent at the top level.
     #[serde(default)]
@@ -53,6 +68,8 @@ struct AdviseReq {
 #[derive(Deserialize)]
 struct AdviseQuery {
     llm: Option<u8>,
+    #[serde(rename = "async")]
+    is_async: Option<u8>,
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -79,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
         out,
         slots: Semaphore::new(2),
         cache: Mutex::new(HashMap::new()),
+        jobs: Mutex::new(HashMap::new()),
+        next_job: AtomicU64::new(1),
     });
     let cors = match env("POLICY_CORS_ORIGINS") {
         Some(list) => CorsLayer::new()
@@ -91,24 +110,81 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/policies", get(|| async { Json(json!({"policies": policies::POLICIES})) }))
         .route("/advise", post(advise))
+        .route("/jobs/:id", get(job))
         .layer(cors)
         .with_state(app.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("policy_api on http://{addr} (llm: {})", app.llm.name().unwrap_or_else(|| "off, rules only".into()));
+    println!(
+        "policy_api on http://{addr} (claude key on server: {}, local: {})",
+        app.llm.server_claude(),
+        app.llm.local().unwrap_or("none")
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }
 
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
+    let default = match app.llm.pick("", None) {
+        Ok(Some(p)) => app.llm.label(&p),
+        _ => "rules".into(),
+    };
     Json(json!({
         "ok": true,
-        "llm": app.llm.enabled(),
-        "model": app.llm.name(),
+        "providers": {
+            "claude": {"model": app.llm.model, "server_key": app.llm.server_claude(), "user_key_header": "x-anthropic-key"},
+            "local": app.llm.local(),
+            "rules": true,
+        },
+        "default": default,
         "policies": policies::POLICIES.len(),
     }))
 }
 
-async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, Json(req): Json<AdviseReq>) -> Response {
+async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, headers: HeaderMap, Json(req): Json<AdviseReq>) -> Response {
+    let user_key = headers
+        .get("x-anthropic-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let want = if q.llm == Some(0) { "rules".to_string() } else { req.provider.trim().to_lowercase() };
+    let provider = match app.llm.pick(&want, user_key) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    if q.is_async != Some(1) {
+        let (code, body) = run_advice(&app, req, provider).await;
+        return (code, Json(body)).into_response();
+    }
+    let id = app.next_job.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut jobs = app.jobs.lock().await;
+        // drop finished jobs beyond the last 100
+        if jobs.len() > 100 {
+            let mut done: Vec<u64> = jobs.iter().filter(|(_, j)| matches!(j, Job::Done(..))).map(|(k, _)| *k).collect();
+            done.sort();
+            for k in done.iter().take(done.len().saturating_sub(50)) {
+                jobs.remove(k);
+            }
+        }
+        jobs.insert(id, Job::Running(Instant::now()));
+    }
+    let a = app.clone();
+    tokio::spawn(async move {
+        let (code, body) = run_advice(&a, req, provider).await;
+        a.jobs.lock().await.insert(id, Job::Done(code, body));
+    });
+    (StatusCode::ACCEPTED, Json(json!({"job": id, "status": "running", "poll": format!("/jobs/{id}")}))).into_response()
+}
+
+async fn job(State(app): State<Arc<App>>, Path(id): Path<u64>) -> Response {
+    match app.jobs.lock().await.get(&id) {
+        None => err(StatusCode::NOT_FOUND, "no such job"),
+        Some(Job::Running(t)) => (StatusCode::ACCEPTED, Json(json!({"job": id, "status": "running", "seconds": t.elapsed().as_secs()}))).into_response(),
+        Some(Job::Done(code, body)) => (*code, Json(body.clone())).into_response(),
+    }
+}
+
+async fn run_advice(app: &App, req: AdviseReq, provider: Option<llm::Provider>) -> (StatusCode, Value) {
     let mut models = req.models;
     for k in MODEL_KEYS {
         if let Some(v) = req.rest.get(*k) {
@@ -117,7 +193,7 @@ async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, Json(
     }
     models.retain(|k, v| MODEL_KEYS.contains(&k.as_str()) && v.is_object());
     if models.is_empty() {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, format!("send at least one model result under `models`: {}", MODEL_KEYS.join(", ")));
+        return (StatusCode::UNPROCESSABLE_ENTITY, json!({"error": format!("send at least one model result under `models`: {}", MODEL_KEYS.join(", "))}));
     }
     let language = if req.language.is_empty() { "English".to_string() } else { req.language };
 
@@ -125,35 +201,35 @@ async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, Json(
     let triggers = rules::run(&facts);
     let caveats = facts::caveats(&models);
     if facts.0.is_empty() {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "no usable numbers found in the model results (expected flood_api response shapes)");
+        return (StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "no usable numbers found in the model results (expected flood_api response shapes)"}));
     }
 
-    let use_llm = app.llm.enabled() && q.llm != Some(0);
+    let label = provider.as_ref().map(|p| app.llm.label(p));
     let user = llm::prompt(&facts, &triggers, &caveats, &req.area, &req.question, &language);
     let key = {
         let mut h = DefaultHasher::new();
-        (use_llm, &user).hash(&mut h);
+        (&label, &user).hash(&mut h);
         h.finish()
     };
     if let Some(v) = app.cache.lock().await.get(&key) {
         let mut v = v.clone();
         v["cached"] = true.into();
-        return Json(v).into_response();
+        return (StatusCode::OK, v);
     }
 
     let mut ai_rejected: Option<Value> = None;
     let mut body = None;
-    if use_llm {
+    if let (Some(p), Some(label)) = (&provider, &label) {
         let _slot = app.slots.acquire().await;
-        let t0 = std::time::Instant::now();
-        let res = app.llm.ask(&user).await;
+        let t0 = Instant::now();
+        let res = app.llm.ask(p, &user).await;
         let secs = t0.elapsed().as_secs_f64();
         let (log, b) = match res {
             Ok((mut advice, raw, usage)) => {
                 let problems = llm::validate(&mut advice, &facts);
                 let log = json!({"raw": raw, "usage": usage, "problems": problems, "seconds": secs});
                 if problems.is_empty() {
-                    (log, Some(from_llm(&advice, &facts, &app.llm.name().unwrap_or_default())))
+                    (log, Some(from_llm(&advice, &facts, label)))
                 } else {
                     ai_rejected = Some(json!({"reason": "validation failed", "problems": problems}));
                     (log, None)
@@ -165,7 +241,7 @@ async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, Json(
             }
         };
         body = b;
-        write_log(&app, json!({"area": req.area, "prompt": user, "result": log})).await;
+        write_log(app, json!({"area": req.area, "model": label, "prompt": user, "result": log})).await;
     }
     let mut body = body.unwrap_or_else(|| from_rules(&triggers, &facts));
     body["ai_rejected"] = ai_rejected.unwrap_or(Value::Null);
@@ -181,7 +257,7 @@ async fn advise(State(app): State<Arc<App>>, Query(q): Query<AdviseQuery>, Json(
         }
         c.insert(key, body.clone());
     }
-    Json(body).into_response()
+    (StatusCode::OK, body)
 }
 
 fn rec_json(rank: usize, id: &str, priority: &str, why: &str, evidence: &[String], facts: &facts::Facts) -> Value {

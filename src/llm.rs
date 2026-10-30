@@ -19,6 +19,13 @@ pub struct Llm {
     pub local_threads: u32,
 }
 
+pub enum Provider {
+    /// Claude; `Some(key)` = key sent by the frontend for this request only (never stored)
+    Claude(Option<String>),
+    /// ollama model name
+    Local(String),
+}
+
 #[derive(Deserialize, Clone)]
 pub struct LlmRec {
     pub policy_id: String,
@@ -112,24 +119,41 @@ impl Llm {
         self.key.is_some() || self.token.is_some()
     }
 
-    pub fn enabled(&self) -> bool {
-        self.claude() || self.local_model.is_some()
+    pub fn local(&self) -> Option<&str> {
+        self.local_model.as_deref()
     }
 
-    /// Model that answers: Claude when a key is set, else the local model.
-    pub fn name(&self) -> Option<String> {
-        if self.claude() {
-            Some(self.model.clone())
-        } else {
-            self.local_model.as_ref().map(|m| format!("local:{m}"))
+    pub fn server_claude(&self) -> bool {
+        self.claude()
+    }
+
+    /// Pick the backend. `want` = "claude" | "local" | "rules" | "" (server default:
+    /// Claude when a key is known, else local, else rules). `user_key` comes from the frontend.
+    pub fn pick(&self, want: &str, user_key: Option<String>) -> std::result::Result<Option<Provider>, String> {
+        let has_claude = user_key.is_some() || self.claude();
+        match want {
+            "rules" => Ok(None),
+            "claude" if has_claude => Ok(Some(Provider::Claude(user_key))),
+            "claude" => Err("no Claude API key: enter one in the frontend or pick local".into()),
+            "local" => self.local().map(|m| Some(Provider::Local(m.into()))).ok_or_else(|| "no local model on this server".into()),
+            "" if has_claude => Ok(Some(Provider::Claude(user_key))),
+            "" => Ok(self.local().map(|m| Provider::Local(m.into()))),
+            w => Err(format!("unknown provider '{w}' (claude, local, rules)")),
+        }
+    }
+
+    pub fn label(&self, p: &Provider) -> String {
+        match p {
+            Provider::Claude(_) => self.model.clone(),
+            Provider::Local(m) => format!("local:{m}"),
         }
     }
 
     /// Returns (parsed advice, raw text, usage).
-    pub async fn ask(&self, user: &str) -> Result<(LlmAdvice, String, Value)> {
-        match (&self.local_model, self.claude()) {
-            (Some(m), false) => self.ask_local(m, user).await,
-            _ => self.ask_claude(user).await,
+    pub async fn ask(&self, p: &Provider, user: &str) -> Result<(LlmAdvice, String, Value)> {
+        match p {
+            Provider::Local(m) => self.ask_local(m, user).await,
+            Provider::Claude(k) => self.ask_claude(k.as_deref(), user).await,
         }
     }
 
@@ -158,7 +182,7 @@ impl Llm {
         Ok((advice, text, usage))
     }
 
-    async fn ask_claude(&self, user: &str) -> Result<(LlmAdvice, String, Value)> {
+    async fn ask_claude(&self, user_key: Option<&str>, user: &str) -> Result<(LlmAdvice, String, Value)> {
         let body = json!({
             "model": self.model,
             "max_tokens": 16000,
@@ -173,7 +197,7 @@ impl Llm {
             .header("anthropic-version", "2026-10-21")
             .header("anthropic-beta", "server-side-fallback-2026-07-01")
             .json(&body);
-        req = match (&self.key, &self.token) {
+        req = match (user_key.or(self.key.as_deref()), &self.token) {
             (Some(k), _) => req.header("x-api-key", k),
             (None, Some(t)) => req.bearer_auth(t),
             _ => bail!("no Anthropic credentials"),
