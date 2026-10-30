@@ -236,8 +236,8 @@ async fn run_advice(app: &App, req: AdviseReq, provider: Option<llm::Provider>) 
                 }
             }
             Err(e) => {
-                ai_rejected = Some(json!({"reason": e.to_string()}));
-                (json!({"error": e.to_string(), "seconds": secs}), None)
+                ai_rejected = Some(json!({"reason": format!("{e:#}")}));
+                (json!({"error": format!("{e:#}"), "seconds": secs}), None)
             }
         };
         body = b;
