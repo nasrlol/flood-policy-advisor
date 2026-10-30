@@ -67,13 +67,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&out).await?;
     let app = Arc::new(App {
         llm: llm::Llm {
-            http: reqwest::Client::builder().timeout(Duration::from_secs(300)).build()?,
+            http: reqwest::Client::builder().timeout(Duration::from_secs(env("POLICY_TIMEOUT_S").and_then(|v| v.parse().ok()).unwrap_or(900))).build()?,
             key: env("ANTHROPIC_API_KEY"),
             token: env("ANTHROPIC_AUTH_TOKEN"),
             model: env("POLICY_MODEL").unwrap_or_else(|| "claude-opus-5-5".into()),
             effort: env("POLICY_EFFORT").unwrap_or_else(|| "medium".into()),
             local_url: env("POLICY_LOCAL_URL").unwrap_or_else(|| "http://127.0.0.1:11434".into()),
             local_model: env("POLICY_LOCAL_MODEL"),
+            local_threads: env("POLICY_LOCAL_THREADS").and_then(|v| v.parse().ok()).unwrap_or(6),
         },
         out,
         slots: Semaphore::new(2),

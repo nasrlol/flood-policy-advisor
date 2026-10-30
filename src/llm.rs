@@ -16,6 +16,7 @@ pub struct Llm {
     pub effort: String,
     pub local_url: String,           // ollama
     pub local_model: Option<String>, // e.g. qwen3:8b; used when no Anthropic credentials
+    pub local_threads: u32,
 }
 
 #[derive(Deserialize, Clone)]
@@ -70,17 +71,40 @@ fn schema() -> Value {
     })
 }
 
+/// System prompt = rules + the policy catalogue. It never changes, so Claude can cache it and
+/// ollama reuses its KV cache; only the user message (facts) is new per request.
+pub fn system() -> String {
+    let mut s = format!("{SYSTEM}\n\nPolicy catalogue (id | horizon | title: what | 2021 lesson):\n");
+    for p in POLICIES {
+        s += &format!("- {} | {} | {}: {} | {}\n", p.id, p.horizon, p.title, p.what, p.lesson_2021);
+    }
+    s
+}
+
+fn val(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
 pub fn prompt(facts: &Facts, triggers: &[Trigger], caveats: &[String], area: &str, question: &str, language: &str) -> String {
-    json!({
-        "area": area,
-        "question": if question.is_empty() { "Which policies should the mayor take, in which order?" } else { question },
-        "language": language,
-        "facts": facts.0,
-        "rule_candidates": triggers,
-        "model_caveats": caveats,
-        "policy_catalogue": POLICIES,
-    })
-    .to_string()
+    let q = if question.is_empty() { "Which policies should the mayor take, in which order?" } else { question };
+    let mut s = format!("Area: {area}\nQuestion: {q}\nAnswer in: {language}\n\nFacts (id = value: meaning):\n");
+    for f in &facts.0 {
+        s += &format!("{} = {}: {}\n", f.id, val(&f.value), f.text);
+    }
+    s += "\nRule-based candidates (policy, score: reasons):\n";
+    for t in triggers {
+        s += &format!("{}, {:.1}: {}\n", t.policy_id, t.score, t.reasons.join("; "));
+    }
+    if !caveats.is_empty() {
+        s += "\nModel caveats:\n";
+        for c in caveats {
+            s += &format!("- {c}\n");
+        }
+    }
+    s
 }
 
 impl Llm {
@@ -115,8 +139,8 @@ impl Llm {
             "stream": false,
             "think": false,
             "format": schema(),
-            "options": {"temperature": 0.2, "num_ctx": 16384},
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+            "options": {"temperature": 0.2, "num_ctx": 16384, "num_thread": self.local_threads},
+            "messages": [{"role": "system", "content": system()}, {"role": "user", "content": user}],
         });
         let url = format!("{}/api/chat", self.local_url.trim_end_matches('/'));
         let r = self.http.post(&url).json(&body).send().await.context("local model unreachable")?;
@@ -140,7 +164,7 @@ impl Llm {
             "max_tokens": 16000,
             "fallbacks": "default",
             "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": schema()}},
-            "system": SYSTEM,
+            "system": [{"type": "text", "text": system(), "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": user}],
         });
         let mut req = self
